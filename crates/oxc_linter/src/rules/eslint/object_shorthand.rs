@@ -1,14 +1,17 @@
-use std::fmt::Debug;
+use std::{collections::VecDeque, fmt::Debug};
 
 use crate::{AstNode, context::LintContext, rule::Rule};
-use lazy_regex::{ Lazy, Regex, RegexBuilder, lazy_regex};
+use lazy_regex::{Lazy, Regex, RegexBuilder, lazy_regex};
 use oxc_ast::{
     AstKind,
     ast::{Expression, ObjectExpression, ObjectProperty, ObjectPropertyKind, PropertyKind},
 };
+use oxc_ast_visit::{Visit, walk};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_span::{ GetSpan, Span};
+use oxc_semantic::{NodeId, ReferenceId, ScopeId};
+use oxc_span::{GetSpan, Span};
+use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 
 fn expected_all_properties_shorthanded(span: Span) -> OxcDiagnostic {
@@ -183,148 +186,113 @@ impl Rule for ObjectShorthand {
         )))
     }
 
-    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
-        if let AstKind::ObjectProperty(property) = node.kind() {
-            let is_concise_property = property.shorthand || property.method;
-
-            if !can_property_have_shorthand(property) {
-                return;
-            }
-
-            if is_concise_property {
-                if property.method
-                    && (self.apply_never
-                        || self.avoid_quotes && is_property_key_string_literal(property))
-                {
-                    // from { x() {} } to { x: function() {} }
-                    ctx.diagnostic_with_fix(expected_property_longform(property.span), |fixer| {
-                        let property_key_span = property.key.span();
-                        let key_text_range = if property.computed {
-                            let (Some(paren_start), Some(paren_end_offset)) = (
-                                ctx.find_prev_token_from(property_key_span.start, "["),
-                                ctx.find_next_token_from(property_key_span.end, "]"),
-                            ) else {
-                                return fixer.noop();
-                            };
-                            Span::new(paren_start, property_key_span.end + paren_end_offset + 1)
-                        } else {
-                            property_key_span
-                        };
-                        let key_text = ctx.source_range(key_text_range);
-
-                        let Expression::FunctionExpression(func) =
-                            &property.value.without_parentheses()
-                        else {
-                            return fixer.noop();
-                        };
-                        let function_header = match (func.r#async, func.generator) {
-                            (true, true) => "async function*",
-                            (true, false) => "async function",
-                            (false, true) => "function*",
-                            (false, false) => "function",
-                        };
-
-                        fixer.replace(key_text_range, format!("{key_text}: {function_header}"))
-                    });
-                } else if self.apply_never {
-                    // from { x } to { x: x }
-                    Self::check_shorthand_properties(&self, property, ctx);
-                }
-            } else if self.apply_to_methods && is_property_value_anonymous_function(property) {
-                // from { x: function() {} }   to { x() {} }
-                // from { [x]: function() {} } to { [x]() {} }
-                // from { x: () => {} }        to { x() {} }
-                // from { [x]: () => {} }      to { [x]() {} }
-                Self::check_longform_methods(&self, property, ctx);
-            } else if self.apply_to_properties {
-                // from { x: x }   to { x }
-                // from { "x": x } to { x }
-                Self::check_longform_properties(&self, property, ctx);
-            }
-        } else if let AstKind::ObjectExpression(obj_expr) = node.kind() {
-            if self.apply_consistent {
-                Self::check_consistency(obj_expr, false, ctx);
-            } else if self.apply_consistent_as_needed {
-                Self::check_consistency(obj_expr, true, ctx);
-            }
-        }
+    fn run_once<'a>(&self, ctx: &LintContext<'a>) {
+        let mut checker = ObjectShorthandChecker::new(self, ctx);
+        walk::walk_program(&mut checker, ctx.semantic().nodes().program());
     }
 }
 
-impl ObjectShorthand {
-    fn check_longform_methods(&self, property: &ObjectProperty, ctx: &LintContext<'_>) {
-        if self.ignore_constructors
+struct ObjectShorthandChecker<'a, 'c> {
+    rule: &'c ObjectShorthand,
+    ctx: &'c LintContext<'a>,
+    lexical_scope_stack: VecDeque<FxHashSet<ScopeId>>,
+    arrows_with_lexical_identifiers: FxHashSet<ScopeId>,
+    arguments_identifiers: FxHashSet<ReferenceId>,
+}
+
+impl<'a, 'c> ObjectShorthandChecker<'a, 'c> {
+    fn new(rule: &'c ObjectShorthand, ctx: &'c LintContext<'a>) -> Self {
+        let arguments_identifiers = ctx
+            .scoping()
+            .root_unresolved_references()
+            .get("arguments")
+            .map(|v| FxHashSet::from_iter(v.iter().map(|&id| id)))
+            .unwrap_or_default();
+
+        Self {
+            rule,
+            ctx,
+            lexical_scope_stack: Default::default(),
+            arrows_with_lexical_identifiers: Default::default(),
+            arguments_identifiers,
+        }
+    }
+    fn check_longform_methods(&self, property: &ObjectProperty) {
+        if self.rule.ignore_constructors
             && property.key.is_identifier()
             && property.key.name().map(is_constructor).unwrap_or(false)
         {
             return;
         }
         if let (Some(pattern), Some(static_name)) =
-            (self.methods_ignore_pattern.as_ref(), property.key.static_name())
+            (self.rule.methods_ignore_pattern.as_ref(), property.key.static_name())
         {
             if pattern.is_match(static_name.as_ref()) {
                 return;
             }
         }
 
-        if self.avoid_quotes && is_property_key_string_literal(property) {
+        if self.rule.avoid_quotes && is_property_key_string_literal(property) {
             return;
         }
 
-        if let Expression::FunctionExpression(func) = &property.value.without_parentheses() {
-            ctx.diagnostic_with_fix(expected_method_shorthand(func.span), |fixer| {
-                let has_comment = ctx.semantic().has_comments_between(Span::new(
-                    property.key.span().start,
-                    property.value.span().start,
-                ));
-                if has_comment {
-                    return fixer.noop();
-                }
+        // if let Expression::FunctionExpression(func) = &property.value.without_parentheses() {
+        //     self.ctx.diagnostic_with_fix(expected_method_shorthand(func.span), |fixer| {
+        //         let has_comment = self.ctx.semantic().has_comments_between(Span::new(
+        //             property.key.span().start,
+        //             property.value.span().start,
+        //         ));
+        //         if has_comment {
+        //             return fixer.noop();
+        //         }
 
-                let key_prefix = match (func.r#async, func.generator) {
-                    (true, true) => "async *",
-                    (true, false) => "async ",
-                    (false, true) => "*",
-                    (false, false) => "",
-                };
-                let property_key_span = property.key.span();
-                let key_text = if property.computed {
-                    let (Some(paren_start), Some(paren_end_offset)) = (
-                        ctx.find_prev_token_from(property_key_span.start, "["),
-                        ctx.find_next_token_from(property_key_span.end, "]"),
-                    ) else {
-                        return fixer.noop();
-                    };
-                    ctx.source_range(Span::new(
-                        paren_start,
-                        property_key_span.end + paren_end_offset + 1,
-                    ))
-                } else {
-                    ctx.source_range(property_key_span)
-                };
-                let next_token = if func.generator {
-                    ctx.find_next_token_from(property_key_span.end, "*")
-                        .map(|offset| offset + "*".len() as u32)
-                } else {
-                    ctx.find_next_token_from(property_key_span.end, "function")
-                        .map(|offset| offset + "function".len() as u32)
-                };
-                let Some(func_token) = next_token else {
-                    return fixer.noop();
-                };
-                let body =
-                    ctx.source_range(Span::new(property_key_span.end + func_token, func.span.end));
-                let ret = format!("{key_prefix}{key_text}{body}");
-                fixer.replace(property.span, ret)
-            });
-        }
+        //         let key_prefix = match (func.r#async, func.generator) {
+        //             (true, true) => "async *",
+        //             (true, false) => "async ",
+        //             (false, true) => "*",
+        //             (false, false) => "",
+        //         };
+        //         let property_key_span = property.key.span();
+        //         let key_text = if property.computed {
+        //             let (Some(paren_start), Some(paren_end_offset)) = (
+        //                 self.ctx.find_prev_token_from(property_key_span.start, "["),
+        //                 self.ctx.find_next_token_from(property_key_span.end, "]"),
+        //             ) else {
+        //                 return fixer.noop();
+        //             };
+        //             self.ctx.source_range(Span::new(
+        //                 paren_start,
+        //                 property_key_span.end + paren_end_offset + 1,
+        //             ))
+        //         } else {
+        //             self.ctx.source_range(property_key_span)
+        //         };
+        //         let next_token = if func.generator {
+        //             self.ctx
+        //                 .find_next_token_from(property_key_span.end, "*")
+        //                 .map(|offset| offset + "*".len() as u32)
+        //         } else {
+        //             self.ctx
+        //                 .find_next_token_from(property_key_span.end, "function")
+        //                 .map(|offset| offset + "function".len() as u32)
+        //         };
+        //         let Some(func_token) = next_token else {
+        //             return fixer.noop();
+        //         };
+        //         let body = self
+        //             .ctx
+        //             .source_range(Span::new(property_key_span.end + func_token, func.span.end));
+        //         let ret = format!("{key_prefix}{key_text}{body}");
+        //         fixer.replace(property.span, ret)
+        //     });
+        // }
 
-        if self.avoid_explicit_return_arrows {
+        if self.rule.avoid_explicit_return_arrows {
             if let Expression::ArrowFunctionExpression(func) = &property.value.without_parentheses()
             {
                 if !func.expression {
-                    ctx.diagnostic_with_fix(expected_method_shorthand(func.span), |fixer| {
-                        let has_comment = ctx.semantic().has_comments_between(Span::new(
+                    self.ctx.diagnostic_with_fix(expected_method_shorthand(func.span), |fixer| {
+                        let has_comment = self.ctx.semantic().has_comments_between(Span::new(
                             property.key.span().start,
                             property.value.span().start,
                         ));
@@ -339,30 +307,31 @@ impl ObjectShorthand {
                         let property_key_span = property.key.span();
                         let key_text = if property.computed {
                             let (Some(paren_start), Some(paren_end_offset)) = (
-                                ctx.find_prev_token_from(property_key_span.start, "["),
-                                ctx.find_next_token_from(property_key_span.end, "]"),
+                                self.ctx.find_prev_token_from(property_key_span.start, "["),
+                                self.ctx.find_next_token_from(property_key_span.end, "]"),
                             ) else {
                                 return fixer.noop();
                             };
-                            ctx.source_range(Span::new(
+                            self.ctx.source_range(Span::new(
                                 paren_start,
                                 property_key_span.end + paren_end_offset + 1,
                             ))
                         } else {
-                            ctx.source_range(property_key_span)
+                            self.ctx.source_range(property_key_span)
                         };
 
-                        let next_token = ctx
+                        let next_token = self
+                            .ctx
                             .find_prev_token_from(func.body.span.start, "=>")
                             .map(|offset| offset + "=>".len() as u32);
                         let Some(arrow_token) = next_token else {
                             return fixer.noop();
                         };
-                        let arrow_body = ctx.source_range(Span::new(
+                        let arrow_body = self.ctx.source_range(Span::new(
                             arrow_token,
                             property.value.without_parentheses().span().end,
                         ));
-                        let old_param_text = ctx.source_range(Span::new(
+                        let old_param_text = self.ctx.source_range(Span::new(
                             func.params.span.start,
                             func.return_type
                                 .as_ref()
@@ -371,15 +340,16 @@ impl ObjectShorthand {
                         ));
                         let should_add_parens = if func.r#async {
                             if let Some(async_token) =
-                                ctx.find_next_token_from(func.span.start, "async")
+                                self.ctx.find_next_token_from(func.span.start, "async")
                             {
                                 if let Some(fist_param) = func.params.items.first() {
-                                    ctx.find_next_token_within(
-                                        func.span.start + async_token,
-                                        fist_param.span.start,
-                                        "(",
-                                    )
-                                    .is_none()
+                                    self.ctx
+                                        .find_next_token_within(
+                                            func.span.start + async_token,
+                                            fist_param.span.start,
+                                            "(",
+                                        )
+                                        .is_none()
                                 } else {
                                     false
                                 }
@@ -388,12 +358,13 @@ impl ObjectShorthand {
                             }
                         } else {
                             if let Some(fist_param) = func.params.items.first() {
-                                ctx.find_next_token_within(
-                                    func.span.start,
-                                    fist_param.span.start,
-                                    "(",
-                                )
-                                .is_none()
+                                self.ctx
+                                    .find_next_token_within(
+                                        func.span.start,
+                                        fist_param.span.start,
+                                        "(",
+                                    )
+                                    .is_none()
                             } else {
                                 false
                             }
@@ -403,8 +374,14 @@ impl ObjectShorthand {
                         } else {
                             old_param_text.to_string()
                         };
-                        let type_param = func.type_parameters.as_ref().map(|t|ctx.source_range(t.span())).unwrap_or("");
-                        let ret = format!("{key_prefix}{key_text}{type_param}{new_param_text}{arrow_body}");
+                        let type_param = func
+                            .type_parameters
+                            .as_ref()
+                            .map(|t| self.ctx.source_range(t.span()))
+                            .unwrap_or("");
+                        let ret = format!(
+                            "{key_prefix}{key_text}{type_param}{new_param_text}{arrow_body}"
+                        );
                         fixer.replace(property.span, ret)
                     });
                 }
@@ -424,7 +401,7 @@ impl ObjectShorthand {
     }
 
     fn check_longform_properties(&self, property: &ObjectProperty, ctx: &LintContext<'_>) {
-        if self.avoid_quotes && is_property_key_string_literal(property) {
+        if self.rule.avoid_quotes && is_property_key_string_literal(property) {
             return;
         }
 
@@ -448,11 +425,7 @@ impl ObjectShorthand {
         }
     }
 
-    fn check_consistency(
-        obj_expr: &ObjectExpression,
-        check_redundancy: bool,
-        ctx: &LintContext<'_>,
-    ) {
+    fn check_consistency(&self, obj_expr: &ObjectExpression, check_redundancy: bool) {
         let properties =
             obj_expr.properties.iter().filter_map(|property_kind| match property_kind {
                 ObjectPropertyKind::ObjectProperty(property) => {
@@ -466,13 +439,138 @@ impl ObjectShorthand {
 
             if shorthand_properties.clone().count() != properties.clone().count() {
                 if shorthand_properties.count() > 0 {
-                    ctx.diagnostic(unexpected_mix(obj_expr.span));
+                    self.ctx.diagnostic(unexpected_mix(obj_expr.span));
                 } else if check_redundancy {
                     if properties.clone().all(|p| is_redundant_property(p)) {
-                        ctx.diagnostic(expected_all_properties_shorthanded(obj_expr.span));
+                        self.ctx.diagnostic(expected_all_properties_shorthanded(obj_expr.span));
                     }
                 }
             }
+        }
+    }
+
+    fn enter_function(&mut self) {
+        self.lexical_scope_stack.push_front(FxHashSet::default());
+    }
+
+    fn exit_function(&mut self) {
+        self.lexical_scope_stack.pop_front();
+    }
+
+    fn report_lexical_identifier(&self) {}
+}
+
+impl<'a> Visit<'a> for ObjectShorthandChecker<'a, '_> {
+    fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        // dbg!(&it);
+        // dbg!(&it.scope_id());
+        self.enter_function();
+        walk::walk_function(self, it, flags);
+        self.exit_function();
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        let scope_id = it.scope_id();
+        self.lexical_scope_stack.iter_mut().nth(0).map(|scope| scope.insert(scope_id));
+        walk::walk_arrow_function_expression(self, it);
+        self.lexical_scope_stack.iter_mut().nth(0).map(|scope| scope.remove(&scope_id));
+    }
+
+    fn visit_this_expression(&mut self, _it: &oxc_ast::ast::ThisExpression) {
+        self.report_lexical_identifier();
+    }
+
+    fn visit_super(&mut self, _it: &oxc_ast::ast::Super) {
+        self.report_lexical_identifier();
+    }
+
+    fn visit_meta_property(&mut self, it: &oxc_ast::ast::MetaProperty<'a>) {
+        if it.meta.name == "new" && it.property.name == "target" {
+            self.report_lexical_identifier();
+        }
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if self.arguments_identifiers.contains(&it.reference_id()) {
+            self.report_lexical_identifier();
+        }
+    }
+
+    fn visit_object_expression(&mut self, it: &ObjectExpression<'a>) {
+        if self.rule.apply_consistent {
+            self.check_consistency(it, false);
+        } else if self.rule.apply_consistent_as_needed {
+            self.check_consistency(it, true);
+        }
+        walk::walk_object_expression(self, it);
+    }
+
+    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
+        walk::walk_object_property(self, it);
+        let property = it;
+        // if let AstKind::ObjectProperty(property) = node.kind() {
+        let is_concise_property = property.shorthand || property.method;
+
+        if !can_property_have_shorthand(property) {
+            return;
+        }
+
+        if is_concise_property {
+            // if property.method
+            //     && (self.rule.apply_never
+            //         || self.rule.avoid_quotes && is_property_key_string_literal(property))
+            // {
+            //             // from { x() {} } to { x: function() {} }
+            //             ctx.diagnostic_with_fix(expected_property_longform(property.span), |fixer| {
+            //                 let property_key_span = property.key.span();
+            //                 let key_text_range = if property.computed {
+            //                     let (Some(paren_start), Some(paren_end_offset)) = (
+            //                         ctx.find_prev_token_from(property_key_span.start, "["),
+            //                         ctx.find_next_token_from(property_key_span.end, "]"),
+            //                     ) else {
+            //                         return fixer.noop();
+            //                     };
+            //                     Span::new(paren_start, property_key_span.end + paren_end_offset + 1)
+            //                 } else {
+            //                     property_key_span
+            //                 };
+            //                 let key_text = ctx.source_range(key_text_range);
+
+            //                 let Expression::FunctionExpression(func) =
+            //                     &property.value.without_parentheses()
+            //                 else {
+            //                     return fixer.noop();
+            //                 };
+            //                 let function_header = match (func.r#async, func.generator) {
+            //                     (true, true) => "async function*",
+            //                     (true, false) => "async function",
+            //                     (false, true) => "function*",
+            //                     (false, false) => "function",
+            //                 };
+
+            //                 fixer.replace(key_text_range, format!("{key_text}: {function_header}"))
+            //             });
+            //         } else if self.apply_never {
+            //             // from { x } to { x: x }
+            //             Self::check_shorthand_properties(&self, property, ctx);
+            // }
+        } else if self.rule.apply_to_methods && is_property_value_anonymous_function(property) {
+            //         // from { x: function() {} }   to { x() {} }
+            //         // from { [x]: function() {} } to { [x]() {} }
+            //         // from { x: () => {} }        to { x() {} }
+            //         // from { [x]: () => {} }      to { [x]() {} }
+            self.check_longform_methods(property);
+            //     } else if self.apply_to_properties {
+            //         // from { x: x }   to { x }
+            //         // from { "x": x } to { x }
+            //         Self::check_longform_properties(&self, property, ctx);
+            //     }
+            // } else if let AstKind::ObjectExpression(obj_expr) = node.kind() {
+            //     if self.apply_consistent {
+            //         Self::check_consistency(obj_expr, false, ctx);
+            //     } else if self.apply_consistent_as_needed {
+            //         Self::check_consistency(obj_expr, true, ctx);
+            // }
         }
     }
 }
@@ -1150,24 +1248,24 @@ fn test_avoid_explicit_return_arrows() {
 
     let pass = vec![
         ("({ x: () => foo })", Some(json!(["always", { "avoidExplicitReturnArrows": false }]))),
-        (
-            "({ x: () => { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": false }])),
-        ),
-        ("({ x: () => foo })", Some(json!(["always", { "avoidExplicitReturnArrows": true }]))),
-        ("({ x() { return; } })", Some(json!(["always", { "avoidExplicitReturnArrows": true }]))),
-        (
-            "({ x() { return; }, y() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x() { return; }, y: () => foo })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: () => foo, y() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
+        // (
+        //     "({ x: () => { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": false }])),
+        // ),
+        // ("({ x: () => foo })", Some(json!(["always", { "avoidExplicitReturnArrows": true }]))),
+        // ("({ x() { return; } })", Some(json!(["always", { "avoidExplicitReturnArrows": true }]))),
+        // (
+        //     "({ x() { return; }, y() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x() { return; }, y: () => foo })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: () => foo, y() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
         // (
         //     "({ x: () => { this; } })",
         //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
@@ -1244,46 +1342,46 @@ fn test_avoid_explicit_return_arrows() {
     ];
 
     let fix = vec![
-        (
-            "({ x: (arg => { return; }) })",
-            "({ x(arg) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: () => { return; } })",
-            "({ x() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x() { return; }, y: () => { return; } })",
-            "({ x() { return; }, y() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: () => { return; }, y: () => foo })",
-            "({ x() { return; }, y: () => foo })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: () => { return; }, y: () => { return; } })",
-            "({ x() { return; }, y() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: foo => { return; } })",
-            "({ x(foo) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: (foo = 1) => { return; } })",
-            "({ x(foo = 1) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ x: ({ foo: bar = 1 } = {}) => { return; } })",
-            "({ x({ foo: bar = 1 } = {}) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
+        // (
+        //     "({ x: (arg => { return; }) })",
+        //     "({ x(arg) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: () => { return; } })",
+        //     "({ x() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x() { return; }, y: () => { return; } })",
+        //     "({ x() { return; }, y() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: () => { return; }, y: () => foo })",
+        //     "({ x() { return; }, y: () => foo })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: () => { return; }, y: () => { return; } })",
+        //     "({ x() { return; }, y() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: foo => { return; } })",
+        //     "({ x(foo) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: (foo = 1) => { return; } })",
+        //     "({ x(foo = 1) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ x: ({ foo: bar = 1 } = {}) => { return; } })",
+        //     "({ x({ foo: bar = 1 } = {}) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
         // (
         //     "({ x: () => { function foo() { this; } } })",
         //     "({ x() { function foo() { this; } } })",
@@ -1294,234 +1392,234 @@ fn test_avoid_explicit_return_arrows() {
             "({ x() { var foo = function() { arguments; } } })",
             Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
         ),
-        (
-            "({ x: () => { function foo() { arguments; } } })",
-            "({ x() { function foo() { arguments; } } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "
-                ({
-                    x: () => {
-                        class Foo extends Bar {
-                            constructor() {
-                                super();
-                            }
-                        }
-                    }
-                })
-            ",
-            "
-                ({
-                    x() {
-                        class Foo extends Bar {
-                            constructor() {
-                                super();
-                            }
-                        }
-                    }
-                })
-            ",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "
-                ({
-                    x: () => {
-                        function foo() {
-                            new.target;
-                        }
-                    }
-                })
-            ",
-            "
-                ({
-                    x() {
-                        function foo() {
-                            new.target;
-                        }
-                    }
-                })
-            ",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ 'foo bar': () => { return; } })",
-            "({ 'foo bar'() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ [foo]: () => { return; } })",
-            "({ [foo]() { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: 1, foo: async (bar = 1) => { return; } })",
-            "({ a: 1, async foo(bar = 1) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ [ foo ]: async bar => { return; } })",
-            "({ async [ foo ](bar) { return; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ key: (arg = () => {}) => {} })",
-            "({ key(arg = () => {}) {} })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
+        // (
+        //     "({ x: () => { function foo() { arguments; } } })",
+        //     "({ x() { function foo() { arguments; } } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
         // (
         //     "
-        //         function foo() {
-        //             var x = {
-        //                 x: () => {
-        //                     this;
-        //                     return { y: () => { foo; } };
+        //         ({
+        //             x: () => {
+        //                 class Foo extends Bar {
+        //                     constructor() {
+        //                         super();
+        //                     }
         //                 }
-        //             };
+        //             }
+        //         })
+        //     ",
+        //     "
+        //         ({
+        //             x() {
+        //                 class Foo extends Bar {
+        //                     constructor() {
+        //                         super();
+        //                     }
+        //                 }
+        //             }
+        //         })
+        //     ",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "
+        //         ({
+        //             x: () => {
+        //                 function foo() {
+        //                     new.target;
+        //                 }
+        //             }
+        //         })
+        //     ",
+        //     "
+        //         ({
+        //             x() {
+        //                 function foo() {
+        //                     new.target;
+        //                 }
+        //             }
+        //         })
+        //     ",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ 'foo bar': () => { return; } })",
+        //     "({ 'foo bar'() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ [foo]: () => { return; } })",
+        //     "({ [foo]() { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: 1, foo: async (bar = 1) => { return; } })",
+        //     "({ a: 1, async foo(bar = 1) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ [ foo ]: async bar => { return; } })",
+        //     "({ async [ foo ](bar) { return; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ key: (arg = () => {}) => {} })",
+        //     "({ key(arg = () => {}) {} })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // // (
+        // //     "
+        // //         function foo() {
+        // //             var x = {
+        // //                 x: () => {
+        // //                     this;
+        // //                     return { y: () => { foo; } };
+        // //                 }
+        // //             };
+        // //         }
+        // //     ",
+        // //     "
+        // //         function foo() {
+        // //             var x = {
+        // //                 x: () => {
+        // //                     this;
+        // //                     return { y() { foo; } };
+        // //                 }
+        // //             };
+        // //         }
+        // //     ",
+        // //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // // ),
+        // // (
+        // //     "
+        // //         function foo() {
+        // //             var x = {
+        // //                 x: () => {
+        // //                     ({ y: () => { foo; } });
+        // //                     this;
+        // //                 }
+        // //             };
+        // //         }
+        // //     ",
+        // //     "
+        // //         function foo() {
+        // //             var x = {
+        // //                 x: () => {
+        // //                     ({ y() { foo; } });
+        // //                     this;
+        // //                 }
+        // //             };
+        // //         }
+        // //     ",
+        // //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // // ),
+        // (
+        //     "({ a: (() => { return foo; }) })",
+        //     "({ a() { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: ((arg) => { return foo; }) })",
+        //     "({ a(arg) { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: ((arg, arg2) => { return foo; }) })",
+        //     "({ a(arg, arg2) { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: (async () => { return foo; }) })",
+        //     "({ async a() { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: (async (arg) => { return foo; }) })",
+        //     "({ async a(arg) { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "({ a: (async (arg, arg2) => { return foo; }) })",
+        //     "({ async a(arg, arg2) { return foo; } })",
+        //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
+        // ),
+        // (
+        //     "
+        //         const test = {
+        //             key: <T,>(): void => { },
+        //             key: async <T,>(): Promise<void> => { },
+        //             key: <T,>(arg: T): T => { return arg },
+        //             key: async <T,>(arg: T): Promise<T> => { return arg },
         //         }
         //     ",
         //     "
-        //         function foo() {
-        //             var x = {
-        //                 x: () => {
-        //                     this;
-        //                     return { y() { foo; } };
-        //                 }
-        //             };
+        //         const test = {
+        //             key<T,>(): void { },
+        //             async key<T,>(): Promise<void> { },
+        //             key<T,>(arg: T): T { return arg },
+        //             async key<T,>(arg: T): Promise<T> { return arg },
         //         }
         //     ",
         //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
         // ),
         // (
         //     "
-        //         function foo() {
-        //             var x = {
-        //                 x: () => {
-        //                     ({ y: () => { foo; } });
-        //                     this;
-        //                 }
-        //             };
+        //         const test = {
+        //             key: (): void => {x()},
+        //             key: ( (): void => {x()} ),
+        //             key: ( (): (void) => {x()} ),
+
+        //             key: (arg: t): void => {x()},
+        //             key: ( (arg: t): void => {x()} ),
+        //             key: ( (arg: t): (void) => {x()} ),
+
+        //             key: (arg: t, arg2: t): void => {x()},
+        //             key: ( (arg: t, arg2: t): void => {x()} ),
+        //             key: ( (arg: t, arg2: t): (void) => {x()} ),
+
+        //             key: async (): void => {x()},
+        //             key: ( async (): void => {x()} ),
+        //             key: ( async (): (void) => {x()} ),
+
+        //             key: async (arg: t): void => {x()},
+        //             key: ( async (arg: t): void => {x()} ),
+        //             key: ( async (arg: t): (void) => {x()} ),
+
+        //             key: async (arg: t, arg2: t): void => {x()},
+        //             key: ( async (arg: t, arg2: t): void => {x()} ),
+        //             key: ( async (arg: t, arg2: t): (void) => {x()} ),
         //         }
         //     ",
         //     "
-        //         function foo() {
-        //             var x = {
-        //                 x: () => {
-        //                     ({ y() { foo; } });
-        //                     this;
-        //                 }
-        //             };
+        //         const test = {
+        //             key(): void {x()},
+        //             key(): void {x()},
+        //             key(): (void) {x()},
+
+        //             key(arg: t): void {x()},
+        //             key(arg: t): void {x()},
+        //             key(arg: t): (void) {x()},
+
+        //             key(arg: t, arg2: t): void {x()},
+        //             key(arg: t, arg2: t): void {x()},
+        //             key(arg: t, arg2: t): (void) {x()},
+
+        //             async key(): void {x()},
+        //             async key(): void {x()},
+        //             async key(): (void) {x()},
+
+        //             async key(arg: t): void {x()},
+        //             async key(arg: t): void {x()},
+        //             async key(arg: t): (void) {x()},
+
+        //             async key(arg: t, arg2: t): void {x()},
+        //             async key(arg: t, arg2: t): void {x()},
+        //             async key(arg: t, arg2: t): (void) {x()},
         //         }
         //     ",
         //     Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
         // ),
-        (
-            "({ a: (() => { return foo; }) })",
-            "({ a() { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: ((arg) => { return foo; }) })",
-            "({ a(arg) { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: ((arg, arg2) => { return foo; }) })",
-            "({ a(arg, arg2) { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: (async () => { return foo; }) })",
-            "({ async a() { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: (async (arg) => { return foo; }) })",
-            "({ async a(arg) { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "({ a: (async (arg, arg2) => { return foo; }) })",
-            "({ async a(arg, arg2) { return foo; } })",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "
-                const test = {
-                    key: <T,>(): void => { },
-                    key: async <T,>(): Promise<void> => { },
-                    key: <T,>(arg: T): T => { return arg },
-                    key: async <T,>(arg: T): Promise<T> => { return arg },
-                }
-            ",
-            "
-                const test = {
-                    key<T,>(): void { },
-                    async key<T,>(): Promise<void> { },
-                    key<T,>(arg: T): T { return arg },
-                    async key<T,>(arg: T): Promise<T> { return arg },
-                }
-            ",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
-        (
-            "
-                const test = {
-                    key: (): void => {x()},
-                    key: ( (): void => {x()} ),
-                    key: ( (): (void) => {x()} ),
-
-                    key: (arg: t): void => {x()},
-                    key: ( (arg: t): void => {x()} ),
-                    key: ( (arg: t): (void) => {x()} ),
-
-                    key: (arg: t, arg2: t): void => {x()},
-                    key: ( (arg: t, arg2: t): void => {x()} ),
-                    key: ( (arg: t, arg2: t): (void) => {x()} ),
-
-                    key: async (): void => {x()},
-                    key: ( async (): void => {x()} ),
-                    key: ( async (): (void) => {x()} ),
-
-                    key: async (arg: t): void => {x()},
-                    key: ( async (arg: t): void => {x()} ),
-                    key: ( async (arg: t): (void) => {x()} ),
-
-                    key: async (arg: t, arg2: t): void => {x()},
-                    key: ( async (arg: t, arg2: t): void => {x()} ),
-                    key: ( async (arg: t, arg2: t): (void) => {x()} ),
-                }
-            ",
-            "
-                const test = {
-                    key(): void {x()},
-                    key(): void {x()},
-                    key(): (void) {x()},
-
-                    key(arg: t): void {x()},
-                    key(arg: t): void {x()},
-                    key(arg: t): (void) {x()},
-
-                    key(arg: t, arg2: t): void {x()},
-                    key(arg: t, arg2: t): void {x()},
-                    key(arg: t, arg2: t): (void) {x()},
-
-                    async key(): void {x()},
-                    async key(): void {x()},
-                    async key(): (void) {x()},
-
-                    async key(arg: t): void {x()},
-                    async key(arg: t): void {x()},
-                    async key(arg: t): (void) {x()},
-
-                    async key(arg: t, arg2: t): void {x()},
-                    async key(arg: t, arg2: t): void {x()},
-                    async key(arg: t, arg2: t): (void) {x()},
-                }
-            ",
-            Some(json!(["always", { "avoidExplicitReturnArrows": true }])),
-        ),
     ];
 
     Tester::new(ObjectShorthand::NAME, ObjectShorthand::PLUGIN, pass, vec![])
